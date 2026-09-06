@@ -1,6 +1,4 @@
 public without sharing class WCPrizmDailyEnrichment implements Schedulable, Database.AllowsCallouts {
-    private static final Integer MAX_POSTAL_CODES_PER_RUN = 10;
-    private static final Integer AGGREGATE_SCAN_LIMIT = 500;
 
     private static final Set<String> INCOME_VALUES = new Set<String>{
         '$0 to $110,593',
@@ -38,7 +36,7 @@ public without sharing class WCPrizmDailyEnrichment implements Schedulable, Data
 
     @InvocableMethod(
         label='Run PRIZM Daily Enrichment'
-        description='Submits the next 10 highest unpopulated Canadian Household Account postal codes to the PRIZM API and updates matching Accounts.'
+        description='Captures up to 10 new Canadian major-donor postal codes daily and updates matching Household Accounts.'
     )
     public static void runFromFlow(List<String> ignoredInputs) {
         runQueued();
@@ -49,25 +47,19 @@ public without sharing class WCPrizmDailyEnrichment implements Schedulable, Data
     }
 
     public static Id runQueued() {
-        return System.enqueueJob(new PrizmDailyQueueable());
+        return System.enqueueJob(new PrizmDailyQueueable(10));
     }
 
-    public static void runDaily() {
-        List<PostalCodeBucket> buckets = selectPostalCodes();
-        if (buckets.isEmpty()) {
-            return;
-        }
-
-        List<String> postalCodes = new List<String>();
+    public static Boolean runDaily() {
+        // Railway owns cohort membership and permanent capture history.
+        // Never derive new capture eligibility from optional Salesforce fields.
+        Map<String, PrizmResult> resultsByPostalCode = fetchPrizmResults();
         Map<String, Set<String>> rawCodesByNormalized = new Map<String, Set<String>>();
-        for (PostalCodeBucket bucket : buckets) {
-            postalCodes.add(bucket.normalizedPostalCode);
-            rawCodesByNormalized.put(bucket.normalizedPostalCode, bucket.rawPostalCodes);
+        for (String code : resultsByPostalCode.keySet()) {
+            rawCodesByNormalized.put(code, new Set<String>{code, code.replace(' ', '')});
         }
-
-        Map<String, PrizmResult> resultsByPostalCode = fetchPrizmResults(postalCodes);
         if (resultsByPostalCode.isEmpty()) {
-            return;
+            return false;
         }
 
         Set<String> rawCodesToUpdate = new Set<String>();
@@ -78,7 +70,7 @@ public without sharing class WCPrizmDailyEnrichment implements Schedulable, Data
         }
 
         if (rawCodesToUpdate.isEmpty()) {
-            return;
+            return false;
         }
 
         List<Account> updates = new List<Account>();
@@ -131,65 +123,18 @@ public without sharing class WCPrizmDailyEnrichment implements Schedulable, Data
             // Ignoring SaveResult previously made unsuccessful updates look completed.
             update updates;
         }
+        return true;
     }
 
     @TestVisible
-    private static List<PostalCodeBucket> selectPostalCodes() {
-        Map<String, PostalCodeBucket> bucketsByPostalCode = new Map<String, PostalCodeBucket>();
-
-        for (AggregateResult row : [
-            SELECT BillingPostalCode postalCode, COUNT(Id) accountCount
-            FROM Account
-            WHERE RecordType.DeveloperName = 'HH_Account'
-            AND BillingCountryCode = 'CA'
-            AND BillingPostalCode != null
-            AND (PRIZM_Score__c = null OR PRIZM_Score__c != 0)
-            AND (
-                PRIZM_Score__c = null
-                OR Average_Income_in_Postal_Code__c = null
-                OR Property_ownership_and_value__c = null
-            )
-            GROUP BY BillingPostalCode
-            ORDER BY COUNT(Id) DESC
-            LIMIT :AGGREGATE_SCAN_LIMIT
-        ]) {
-            String rawPostalCode = (String) row.get('postalCode');
-            String normalizedPostalCode = normalizePostalCode(rawPostalCode);
-            if (String.isBlank(normalizedPostalCode)) {
-                continue;
-            }
-
-            PostalCodeBucket bucket = bucketsByPostalCode.get(normalizedPostalCode);
-            if (bucket == null) {
-                bucket = new PostalCodeBucket(normalizedPostalCode);
-                bucketsByPostalCode.put(normalizedPostalCode, bucket);
-            }
-            bucket.count += ((Decimal) row.get('accountCount')).intValue();
-            bucket.rawPostalCodes.add(rawPostalCode);
-        }
-
-        List<PostalCodeBucket> buckets = bucketsByPostalCode.values();
-        buckets.sort();
-
-        List<PostalCodeBucket> selected = new List<PostalCodeBucket>();
-        for (PostalCodeBucket bucket : buckets) {
-            selected.add(bucket);
-            if (selected.size() == MAX_POSTAL_CODES_PER_RUN) {
-                break;
-            }
-        }
-        return selected;
-    }
-
-    @TestVisible
-    private static Map<String, PrizmResult> fetchPrizmResults(List<String> postalCodes) {
+    private static Map<String, PrizmResult> fetchPrizmResults() {
         HttpRequest request = new HttpRequest();
         request.setMethod('POST');
-        request.setEndpoint(System.Label.WC_PRIZM_API_Base_URL + '/api/prizm/batch');
+        request.setEndpoint(System.Label.WC_PRIZM_API_Base_URL + '/api/cohort/capture');
         request.setHeader('Content-Type', 'application/json');
         request.setHeader('X-API-Key', System.Label.WC_PRIZM_API_Key);
-        request.setTimeout(60000);
-        request.setBody(JSON.serialize(new Map<String, Object>{ 'postal_codes' => postalCodes }));
+        request.setTimeout(120000);
+        request.setBody('{}');
 
         HttpResponse response = new Http().send(request);
         if (response.getStatusCode() < 200 || response.getStatusCode() >= 300) {
@@ -322,28 +267,15 @@ public without sharing class WCPrizmDailyEnrichment implements Schedulable, Data
         return null;
     }
 
-    @TestVisible
-    private class PostalCodeBucket implements Comparable {
-        private String normalizedPostalCode;
-        private Integer count = 0;
-        private Set<String> rawPostalCodes = new Set<String>();
-
-        private PostalCodeBucket(String normalizedPostalCode) {
-            this.normalizedPostalCode = normalizedPostalCode;
-        }
-
-        public Integer compareTo(Object otherObject) {
-            PostalCodeBucket other = (PostalCodeBucket) otherObject;
-            if (count == other.count) {
-                return normalizedPostalCode.compareTo(other.normalizedPostalCode);
-            }
-            return other.count - count;
-        }
-    }
-
     private class PrizmDailyQueueable implements Queueable, Database.AllowsCallouts {
+        private Integer remaining;
+        private PrizmDailyQueueable(Integer remaining) {
+            this.remaining = remaining;
+        }
         public void execute(QueueableContext context) {
-            runDaily();
+            if (runDaily() && remaining > 1) {
+                System.enqueueJob(new PrizmDailyQueueable(remaining - 1));
+            }
         }
     }
 

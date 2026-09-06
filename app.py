@@ -13,6 +13,7 @@ import requests
 from flask import Flask, Response, jsonify, make_response, request
 
 from cache_manager_new import cache_manager
+from cohort_queue import CohortQueue
 from prizm_client import PrizmClient, PrizmLookupError, normalize_postal_code
 from segment_net_worth import average_household_net_worth, average_household_net_worth_amount
 
@@ -87,6 +88,9 @@ DASHBOARD_HTML = """<!doctype html>
     <span id="reportStatus" class="muted"></span>
   </div>
 
+  <h2>Major-donor coverage</h2>
+  <p id="cohortProgress" class="card">Loading…</p>
+  <a class="button" href="/api/cohort/export.csv">Export major-donor coverage CSV</a>
   <div class="section-title">
     <div><h2>Daily lookup outcomes</h2><div class="muted">Trailing 7 days, grouped by UTC date. Cache hits do not represent new captures.</div></div>
   </div>
@@ -133,6 +137,8 @@ async function loadSummary() {
   text('failed', fmt.format((breakdown.error || 0) + (breakdown.invalid || 0)));
   text('weekLookups', fmt.format(week.lookups || 0));
   text('captureWarning', week.lookups && !week.upstream_attempts ? 'No new upstream lookups in the last 7 days. Check whether the enrichment queue is repeating already captured postal codes.' : '');
+  const cohort = data.cohort || {};
+  text('cohortProgress', cohort.configured ? `${cohort.captured} / ${cohort.unique_codes} codes captured · ${cohort.pending} pending · ${cohort.failed} failed · ${cohort.incomplete} incomplete. ${cohort.source_rows} source accounts; ${cohort.excluded_rows} address exceptions. Daily target: 10 new codes; no automatic repeats.` : 'Cohort has not been imported.');
   const counts = week.by_day || [];
   document.getElementById('dailyCounts').innerHTML = counts.length ? counts.map(row =>
     `<div><strong>${esc(row.day)}</strong>: ${fmt.format(row.lookups || 0)} lookups · ${fmt.format(row.cache_hits || 0)} cache hits · ${fmt.format(row.upstream_attempts || 0)} upstream attempts · <span class="ok">${fmt.format(row.upstream_successful || 0)} upstream success</span> · <span class="bad">${fmt.format(row.failed || 0)} failed</span> · ${fmt.format(row.unique_postal_codes || 0)} unique codes · ${fmt.format(row.newly_captured || 0)} first captures in recorded history</div>`
@@ -254,7 +260,7 @@ def require_authentication():
     if request.path == "/health" or request.method == "OPTIONS":
         return None
 
-    dashboard_paths = {"/", "/dashboard", "/api/dashboard/summary", "/api/cache/entries", "/api/cache/export.csv", "/api/reports/weekly", "/api/lookups", "/api/lookups/failures.csv"}
+    dashboard_paths = {"/", "/dashboard", "/api/dashboard/summary", "/api/cache/entries", "/api/cache/export.csv", "/api/reports/weekly", "/api/lookups", "/api/lookups/failures.csv", "/api/cohort", "/api/cohort/export.csv"}
     if request.path in dashboard_paths:
         if has_valid_dashboard_auth() or (os.environ.get("PRIZM_API_KEY") and has_valid_api_key()):
             return None
@@ -415,6 +421,59 @@ def get_batch_prizm():
     )
 
 
+def cohort_queue():
+    return CohortQueue(cache_manager.db_path)
+
+
+@app.route("/api/cohort", methods=["GET"])
+def cohort_status():
+    queue = cohort_queue()
+    return jsonify({"summary": queue.summary(), "entries": queue.entries()})
+
+
+@app.route("/api/cohort/export.csv", methods=["GET"])
+def cohort_export():
+    response = Response(cohort_queue().export_csv(), mimetype="text/csv")
+    response.headers["Content-Disposition"] = "attachment; filename=major-donor-coverage.csv"
+    return response
+
+
+@app.route("/api/cohort/import", methods=["POST"])
+def import_cohort():
+    if not os.environ.get("PRIZM_API_KEY") or not has_valid_api_key():
+        return jsonify({"error": "Import requires an API key"}), 401
+    if request.content_length is None or request.content_length > 1_000_000:
+        return jsonify({"error": "A CSV body under 1 MB is required"}), 400
+    try:
+        import io
+        summary = cohort_queue().import_accounts(io.StringIO(request.get_data().decode("utf-8-sig")))
+    except (ValueError, UnicodeError):
+        return jsonify({"error": "Invalid Canadian billing-address CSV; cohort unchanged"}), 400
+    return jsonify(summary)
+
+
+@app.route("/api/cohort/capture", methods=["POST"])
+def capture_cohort():
+    # Collection is a mutation and always requires an explicit API key.
+    if not os.environ.get("PRIZM_API_KEY") or not has_valid_api_key():
+        return jsonify({"error": "Collection requires an API key"}), 401
+    queue = cohort_queue()
+    if not queue.summary()["configured"]:
+        return jsonify({"error": "Major-donor cohort has not been imported"}), 503
+    results = []
+    # One code per call keeps Salesforce callouts below transaction time limits.
+    # Its queueable chains ten calls; the database also enforces the daily ceiling.
+    for _ in range(1):
+        code = queue.claim()
+        if code is None:
+            break
+        # Claim persists before network I/O: retries/concurrent requests cannot repeat a code.
+        result = get_prizm_code(code, endpoint="cohort")
+        queue.finish(code, result)
+        results.append(result)
+    return jsonify({"results": results, "summary": queue.summary()})
+
+
 @app.route("/api/segments", methods=["GET"])
 def get_segments():
     return jsonify({"status": "success", "segments": prizm_client.get_all_segments()})
@@ -422,7 +481,9 @@ def get_segments():
 
 @app.route("/api/dashboard/summary", methods=["GET"])
 def dashboard_summary():
-    return jsonify(cache_manager.get_dashboard_summary())
+    summary = cache_manager.get_dashboard_summary()
+    summary["cohort"] = cohort_queue().summary()
+    return jsonify(summary)
 
 
 @app.route("/api/lookups", methods=["GET"])
@@ -535,6 +596,7 @@ def build_weekly_report(days: int = 7) -> Dict[str, Any]:
     summary = cache_manager.get_dashboard_summary()
     events = cache_manager.get_lookup_event_summary(days)
     summary["lookup_events_7d"] = events
+    summary["cohort"] = cohort_queue().summary()
     stats = summary.get("cache_stats", {})
     daily_counts = events.get("by_day", [])
     failures = cache_manager.list_lookup_events(failures_only=True, days=days, limit=20)
@@ -562,6 +624,10 @@ def build_weekly_report(days: int = 7) -> Dict[str, Any]:
         "",
         "Daily lookup outcomes (UTC):",
     ]
+    cohort = summary["cohort"]
+    lines.extend(["", "Major-donor Canadian postal-code coverage:",
+                  f"Captured: {cohort['captured']}; pending: {cohort['pending']}; failed: {cohort['failed']}; incomplete: {cohort['incomplete']}",
+                  "Daily target: 10 never-attempted codes. Failed/incomplete attempts require review; no automatic repeats.", ""])
     if daily_counts:
         for row in daily_counts:
             lines.append(f"- {row.get('day')}: {row.get('lookups', 0)} lookups, {row.get('cache_hits', 0)} cached, {row.get('upstream_successful', 0)} upstream successes, {row.get('failed', 0)} failures")

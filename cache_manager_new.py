@@ -283,6 +283,27 @@ class CacheManager:
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_lookup_events_source ON lookup_events (source)")
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_lookup_events_postal_code ON lookup_events (postal_code)")
 
+                cursor.executescript("""
+                    CREATE TABLE IF NOT EXISTS capture_history (
+                        postal_code TEXT PRIMARY KEY, captured_at TEXT NOT NULL
+                    );
+                    INSERT OR IGNORE INTO capture_history
+                        SELECT postal_code, COALESCE(cached_at, CURRENT_TIMESTAMP)
+                        FROM postal_code_cache WHERE status='success';
+                    CREATE TRIGGER IF NOT EXISTS remember_prizm_capture_insert
+                    AFTER INSERT ON postal_code_cache WHEN NEW.status='success'
+                    BEGIN
+                        INSERT OR IGNORE INTO capture_history VALUES
+                            (NEW.postal_code, COALESCE(NEW.cached_at, CURRENT_TIMESTAMP));
+                    END;
+                    CREATE TRIGGER IF NOT EXISTS remember_prizm_capture_update
+                    AFTER UPDATE ON postal_code_cache WHEN NEW.status='success'
+                    BEGIN
+                        INSERT OR IGNORE INTO capture_history VALUES
+                            (NEW.postal_code, COALESCE(NEW.cached_at, CURRENT_TIMESTAMP));
+                    END;
+                """)
+
                 conn.commit()
                 logger.info("Cache database initialized at %s", self.db_path)
 

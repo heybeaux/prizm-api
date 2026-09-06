@@ -30,10 +30,10 @@ jobs:
           pip install -r requirements.txt ruff
 
       - name: Lint
-        run: ruff check app.py prizm_client.py cache_manager_new.py cache_cli.py test_prizm_api.py
+        run: ruff check app.py prizm_client.py cache_manager_new.py cache_cli.py cohort_queue.py test_prizm_api.py test_cohort_queue.py
 
       - name: Test
-        run: python -m unittest test_prizm_api.py
+        run: python -m unittest test_prizm_api.py test_cohort_queue.py
 
   node:
     name: Node tests and build

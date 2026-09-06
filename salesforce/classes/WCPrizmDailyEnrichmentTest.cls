@@ -3,7 +3,7 @@ private class WCPrizmDailyEnrichmentTest {
     private class PrizmMock implements HttpCalloutMock {
         public HTTPResponse respond(HTTPRequest request) {
             System.assertEquals('POST', request.getMethod());
-            System.assert(request.getEndpoint().endsWith('/api/prizm/batch'));
+            System.assert(request.getEndpoint().endsWith('/api/cohort/capture'));
 
             HttpResponse response = new HttpResponse();
             response.setStatusCode(200);
@@ -92,7 +92,7 @@ private class WCPrizmDailyEnrichmentTest {
 
     @IsTest
     static void schedulableEntryPointRuns() {
-        Test.setMock(HttpCalloutMock.class, new PrizmMock());
+        Test.setMock(HttpCalloutMock.class, new EmptyCohortMock());
 
         Test.startTest();
         System.schedule('WC PRIZM Test Job', '0 0 2 * * ?', new WCPrizmDailyEnrichment());
@@ -101,26 +101,25 @@ private class WCPrizmDailyEnrichmentTest {
         System.assertEquals('V8A 2P4', WCPrizmDailyEnrichment.normalizePostalCode('v8a2p4'));
     }
 
+    private class EmptyCohortMock implements HttpCalloutMock {
+        public HTTPResponse respond(HTTPRequest request) {
+            System.assert(request.getEndpoint().endsWith('/api/cohort/capture'));
+            System.assertEquals('{}', request.getBody());
+            HttpResponse response = new HttpResponse();
+            response.setStatusCode(200);
+            response.setBody('{"results":[],"summary":{"pending":0}}');
+            return response;
+        }
+    }
+
     @IsTest
-    static void missingNetWorthDoesNotBlockQueue() {
-        Id householdType = [SELECT Id FROM RecordType WHERE SobjectType = 'Account' AND DeveloperName = 'HH_Account' LIMIT 1].Id;
-        Account enriched = new Account(
-            Name = 'Optional net worth unavailable', RecordTypeId = householdType,
-            BillingStreet = '1 Test St', BillingCity = 'Powell River', BillingCountryCode = 'CA',
-            BillingStateCode = 'BC', BillingPostalCode = 'V0N 1T0', PRIZM_Score__c = 66,
-            Average_Income_in_Postal_Code__c = '$0 to $110,593',
-            Property_ownership_and_value__c = 'None or Unverifiable'
-        );
-        insert enriched;
-        System.assertEquals(0, WCPrizmDailyEnrichment.selectPostalCodes().size(),
-            'An assigned household must not be selected solely because optional net worth is unavailable.');
-        Account pending = new Account(
-            Name = 'New postal code', RecordTypeId = householdType,
-            BillingStreet = '2 Test St', BillingCity = 'Powell River', BillingCountryCode = 'CA',
-            BillingStateCode = 'BC', BillingPostalCode = 'V8A 2P4'
-        );
-        insert pending;
-        System.assertEquals(1, WCPrizmDailyEnrichment.selectPostalCodes().size());
+    static void exhaustedCohortDoesNotFallBackToSalesforce() {
+        Test.setMock(HttpCalloutMock.class, new EmptyCohortMock());
+        Test.startTest();
+        WCPrizmDailyEnrichment.runDaily();
+        System.assertEquals(1, Limits.getCallouts());
+        System.assertEquals(0, Limits.getDmlStatements());
+        Test.stopTest();
     }
 
     private class MissingNetWorthMock implements HttpCalloutMock {
