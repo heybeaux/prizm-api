@@ -16,6 +16,8 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
+from segment_net_worth import average_household_net_worth, average_household_net_worth_amount
+
 logger = logging.getLogger(__name__)
 
 
@@ -682,6 +684,12 @@ class CacheManager:
 
     def _dashboard_row(self, row: sqlite3.Row) -> Dict[str, Any]:
         data = self._row_to_response_dict(row)
+        amount = average_household_net_worth_amount(data.get("segment_number"))
+        if amount is not None:
+            if not data.get("average_household_net_worth"):
+                data["average_household_net_worth"] = average_household_net_worth(data.get("segment_number"))
+            data["average_household_net_worth_amount"] = amount
+        data["net_worth_source"] = "Historical segment reference" if data.get("average_household_net_worth") else "Unavailable"
         data.update(
             {
                 "cached_at": row["cached_at"],
@@ -723,7 +731,15 @@ class CacheManager:
                            SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) successful,
                            SUM(CASE WHEN status != 'success' THEN 1 ELSE 0 END) failed,
                            SUM(CASE WHEN from_cache = 1 THEN 1 ELSE 0 END) cache_hits,
-                           SUM(CASE WHEN source = 'upstream' THEN 1 ELSE 0 END) upstream_attempts
+                           SUM(CASE WHEN source = 'upstream' THEN 1 ELSE 0 END) upstream_attempts,
+                           COUNT(DISTINCT postal_code) unique_postal_codes,
+                           SUM(CASE WHEN source = 'upstream' AND status = 'success' THEN 1 ELSE 0 END) upstream_successful,
+                           SUM(CASE WHEN source = 'upstream' AND status != 'success' THEN 1 ELSE 0 END) upstream_failed,
+                           SUM(CASE WHEN source = 'upstream' AND status = 'success' AND NOT EXISTS (
+                               SELECT 1 FROM lookup_events prior
+                               WHERE prior.postal_code = lookup_events.postal_code
+                               AND prior.status = 'success' AND prior.id < lookup_events.id
+                           ) THEN 1 ELSE 0 END) newly_captured
                     FROM lookup_events
                     WHERE requested_at >= datetime('now', ?)
                     """,
@@ -738,7 +754,15 @@ class CacheManager:
                            SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) successful,
                            SUM(CASE WHEN status != 'success' THEN 1 ELSE 0 END) failed,
                            SUM(CASE WHEN from_cache = 1 THEN 1 ELSE 0 END) cache_hits,
-                           SUM(CASE WHEN source = 'upstream' THEN 1 ELSE 0 END) upstream_attempts
+                           SUM(CASE WHEN source = 'upstream' THEN 1 ELSE 0 END) upstream_attempts,
+                           COUNT(DISTINCT postal_code) unique_postal_codes,
+                           SUM(CASE WHEN source = 'upstream' AND status = 'success' THEN 1 ELSE 0 END) upstream_successful,
+                           SUM(CASE WHEN source = 'upstream' AND status != 'success' THEN 1 ELSE 0 END) upstream_failed,
+                           SUM(CASE WHEN source = 'upstream' AND status = 'success' AND NOT EXISTS (
+                               SELECT 1 FROM lookup_events prior
+                               WHERE prior.postal_code = lookup_events.postal_code
+                               AND prior.status = 'success' AND prior.id < lookup_events.id
+                           ) THEN 1 ELSE 0 END) newly_captured
                     FROM lookup_events
                     WHERE requested_at >= datetime('now', ?)
                     GROUP BY date(requested_at)
@@ -757,11 +781,43 @@ class CacheManager:
             "cache_stats": self.get_cache_stats(),
             "daily_cache_counts": self.get_daily_cache_counts(30),
             "lookup_events_7d": self.get_lookup_event_summary(7),
-            "recent_failures": self.list_cache_entries(status="error", limit=50),
+            "recent_failures": self.list_lookup_events(failures_only=True, days=7, limit=50),
         }
 
+    def list_lookup_events(self, failures_only=False, days=7, limit=500, offset=0):
+        conditions = ["requested_at >= datetime('now', ?)"]
+        if failures_only:
+            conditions.append("status != 'success'")
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM lookup_events WHERE {' AND '.join(conditions)} "
+                "ORDER BY requested_at DESC, id DESC LIMIT ? OFFSET ?",
+                (f"-{max(1, min(int(days), 3650))} days", max(1, min(int(limit), 5000)), max(0, int(offset))),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    @staticmethod
+    def _csv_value(value):
+        if isinstance(value, str) and value.lstrip().startswith(('=', '+', '-', '@')):
+            return "'" + value
+        return value
+
+    def export_failures_csv(self, days=7):
+        output = io.StringIO()
+        fields = ['postal_code', 'requested_at', 'status', 'source', 'message', 'endpoint', 'batch_id']
+        writer = csv.DictWriter(output, fieldnames=fields)
+        writer.writeheader()
+        offset = 0
+        while True:
+            rows = self.list_lookup_events(failures_only=True, days=days, limit=5000, offset=offset)
+            for row in rows:
+                writer.writerow({field: self._csv_value(row.get(field, '')) for field in fields})
+            if len(rows) < 5000:
+                break
+            offset += len(rows)
+        return output.getvalue()
+
     def export_cache_csv(self, include_expired: bool = False) -> str:
-        rows = self.list_cache_entries(limit=5000, include_expired=include_expired)
         output = io.StringIO()
         fieldnames = [
             "postal_code",
@@ -774,6 +830,7 @@ class CacheManager:
             "average_household_income",
             "average_household_net_worth",
             "average_household_net_worth_amount",
+            "net_worth_source",
             "education",
             "urbanity",
             "occupation",
@@ -796,8 +853,14 @@ class CacheManager:
         ]
         writer = csv.DictWriter(output, fieldnames=fieldnames)
         writer.writeheader()
-        for row in rows:
-            writer.writerow({field: row.get(field, "") for field in fieldnames})
+        offset = 0
+        while True:
+            rows = self.list_cache_entries(limit=5000, offset=offset, include_expired=include_expired)
+            for row in rows:
+                writer.writerow({field: self._csv_value(row.get(field, "")) for field in fieldnames})
+            if len(rows) < 5000:
+                break
+            offset += len(rows)
         return output.getvalue()
 
     def clear_cache(self) -> bool:

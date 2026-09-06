@@ -92,7 +92,6 @@ public without sharing class WCPrizmDailyEnrichment implements Schedulable, Data
             AND (
                 PRIZM_Score__c = null
                 OR Average_Income_in_Postal_Code__c = null
-                OR Average_Net_Worth_in_Postal_Code__c = null
                 OR Property_ownership_and_value__c = null
             )
             LIMIT 9000
@@ -107,9 +106,15 @@ public without sharing class WCPrizmDailyEnrichment implements Schedulable, Data
             if (result.status == 'success') {
                 updateAccount.PRIZM_Score__c = parseDecimal(result.segmentNumber);
                 updateAccount.Average_Income_in_Postal_Code__c = mapIncome(result.averageHouseholdIncome);
-                updateAccount.Average_Net_Worth_in_Postal_Code__c = mapNetWorth(result.averageHouseholdNetWorth, result.averageHouseholdNetWorthAmount);
+                // Net worth is optional historical reference data, not a completion requirement.
+                String netWorth = mapNetWorth(result.averageHouseholdNetWorth, result.averageHouseholdNetWorthAmount);
+                if (netWorth != null) {
+                    updateAccount.Average_Net_Worth_in_Postal_Code__c = netWorth;
+                }
                 updateAccount.WC_Neighbourhood_description__c = firstNonBlank(new List<String>{ result.whoTheyAre, result.segmentDescription });
                 updateAccount.Property_ownership_and_value__c = mapHomeType(result.homeType);
+            } else if (result.retryable) {
+                continue;
             } else {
                 updateAccount.PRIZM_Score__c = 0;
                 updateAccount.WC_Neighbourhood_description__c = firstNonBlank(new List<String>{
@@ -122,7 +127,9 @@ public without sharing class WCPrizmDailyEnrichment implements Schedulable, Data
         }
 
         if (!updates.isEmpty()) {
-            Database.update(updates, false);
+            // Fail the job visibly and roll back the batch if any household update fails.
+            // Ignoring SaveResult previously made unsuccessful updates look completed.
+            update updates;
         }
     }
 
@@ -140,7 +147,6 @@ public without sharing class WCPrizmDailyEnrichment implements Schedulable, Data
             AND (
                 PRIZM_Score__c = null
                 OR Average_Income_in_Postal_Code__c = null
-                OR Average_Net_Worth_in_Postal_Code__c = null
                 OR Property_ownership_and_value__c = null
             )
             GROUP BY BillingPostalCode
@@ -352,6 +358,7 @@ public without sharing class WCPrizmDailyEnrichment implements Schedulable, Data
         private String homeType;
         private String status;
         private String message;
+        private Boolean retryable;
 
         private PrizmResult(Map<String, Object> row) {
             postalCode = (String) row.get('postal_code');
@@ -363,6 +370,7 @@ public without sharing class WCPrizmDailyEnrichment implements Schedulable, Data
             averageHouseholdNetWorthAmount = decimalValue(row.get('average_household_net_worth_amount'));
             homeType = (String) row.get('home_type');
             status = (String) row.get('status');
+            retryable = row.get('retryable') == true;
             message = (String) row.get('message');
         }
 

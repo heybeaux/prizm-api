@@ -100,4 +100,60 @@ private class WCPrizmDailyEnrichmentTest {
 
         System.assertEquals('V8A 2P4', WCPrizmDailyEnrichment.normalizePostalCode('v8a2p4'));
     }
+
+    @IsTest
+    static void missingNetWorthDoesNotBlockQueue() {
+        Id householdType = [SELECT Id FROM RecordType WHERE SobjectType = 'Account' AND DeveloperName = 'HH_Account' LIMIT 1].Id;
+        Account enriched = new Account(
+            Name = 'Optional net worth unavailable', RecordTypeId = householdType,
+            BillingStreet = '1 Test St', BillingCity = 'Powell River', BillingCountryCode = 'CA',
+            BillingStateCode = 'BC', BillingPostalCode = 'V0N 1T0', PRIZM_Score__c = 66,
+            Average_Income_in_Postal_Code__c = '$0 to $110,593',
+            Property_ownership_and_value__c = 'None or Unverifiable'
+        );
+        insert enriched;
+        System.assertEquals(0, WCPrizmDailyEnrichment.selectPostalCodes().size(),
+            'An assigned household must not be selected solely because optional net worth is unavailable.');
+        Account pending = new Account(
+            Name = 'New postal code', RecordTypeId = householdType,
+            BillingStreet = '2 Test St', BillingCity = 'Powell River', BillingCountryCode = 'CA',
+            BillingStateCode = 'BC', BillingPostalCode = 'V8A 2P4'
+        );
+        insert pending;
+        System.assertEquals(1, WCPrizmDailyEnrichment.selectPostalCodes().size());
+    }
+
+    private class MissingNetWorthMock implements HttpCalloutMock {
+        public HTTPResponse respond(HTTPRequest request) {
+            HttpResponse response = new HttpResponse();
+            response.setStatusCode(200);
+            response.setBody('{"results":[{"postal_code":"V8A 2P4","segment_number":"66","average_household_income":"$98,721","home_type":"Single Detached","status":"success"},{"postal_code":"V5U 1J4","status":"error","retryable":true,"message":"quota unavailable"}]}');
+            return response;
+        }
+    }
+
+    @IsTest
+    static void preservesKnownNetWorthAndRetriesTransientFailures() {
+        Id householdType = [SELECT Id FROM RecordType WHERE SobjectType = 'Account' AND DeveloperName = 'HH_Account' LIMIT 1].Id;
+        Account known = new Account(
+            Name = 'Preserve historical value', RecordTypeId = householdType,
+            BillingStreet = '1 Test St', BillingCity = 'Powell River', BillingCountryCode = 'CA',
+            BillingStateCode = 'BC', BillingPostalCode = 'V8A 2P4',
+            Average_Net_Worth_in_Postal_Code__c = '$600K to $1M'
+        );
+        Account retry = new Account(
+            Name = 'Retry quota failure', RecordTypeId = householdType,
+            BillingStreet = '2 Test St', BillingCity = 'Vancouver', BillingCountryCode = 'CA',
+            BillingStateCode = 'BC', BillingPostalCode = 'V5U 1J4'
+        );
+        insert new List<Account>{ known, retry };
+        Test.setMock(HttpCalloutMock.class, new MissingNetWorthMock());
+        Test.startTest();
+        WCPrizmDailyEnrichment.runDaily();
+        Test.stopTest();
+        known = [SELECT Average_Net_Worth_in_Postal_Code__c FROM Account WHERE Id = :known.Id];
+        retry = [SELECT PRIZM_Score__c FROM Account WHERE Id = :retry.Id];
+        System.assertEquals('$600K to $1M', known.Average_Net_Worth_in_Postal_Code__c);
+        System.assertEquals(null, retry.PRIZM_Score__c, 'Temporary quota failures must not permanently exclude households.');
+    }
 }
