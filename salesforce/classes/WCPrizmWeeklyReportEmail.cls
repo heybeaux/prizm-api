@@ -37,7 +37,10 @@ public without sharing class WCPrizmWeeklyReportEmail implements Schedulable {
             email.setToAddresses(new List<String>{ DEFAULT_RECIPIENT });
             email.setSubject(subject);
             email.setPlainTextBody(body);
-            Messaging.sendEmail(new List<Messaging.SingleEmailMessage>{ email });
+            Messaging.SendEmailResult[] sent = Messaging.sendEmail(new List<Messaging.SingleEmailMessage>{ email });
+            if (!sent[0].isSuccess()) {
+                throw new CalloutException('PRIZM report email failed: ' + sent[0].getErrors()[0].getMessage());
+            }
         }
 
         private String stringValue(Object value) {

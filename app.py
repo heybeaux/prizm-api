@@ -13,6 +13,8 @@ import requests
 from flask import Flask, Response, jsonify, make_response, request
 
 from cache_manager_new import cache_manager
+from cohort_queue import CohortQueue
+from historical_import import merge_history
 from prizm_client import PrizmClient, PrizmLookupError, normalize_postal_code
 from segment_net_worth import average_household_net_worth, average_household_net_worth_amount
 
@@ -57,7 +59,9 @@ DASHBOARD_HTML = """<!doctype html>
     .muted { color:var(--muted); }
     .section-title { display:flex; justify-content:space-between; align-items:end; gap:12px; margin:28px 0 12px; }
     .section-title h2 { margin:0; font-size:20px; }
-    pre { white-space:pre-wrap; }
+    pre { white-space:pre-wrap; overflow-wrap:anywhere; max-width:540px; }
+    #reportStatus { white-space:pre-wrap; }
+    table { display:block; overflow-x:auto; }
     @media (max-width:900px) { .grid { grid-template-columns:repeat(2,minmax(0,1fr)); } main, header { padding-left:18px; padding-right:18px; } table { font-size:13px; } }
     @media (max-width:580px) { .grid { grid-template-columns:1fr; } th:nth-child(5),td:nth-child(5),th:nth-child(6),td:nth-child(6){display:none;} }
   </style>
@@ -72,25 +76,30 @@ DASHBOARD_HTML = """<!doctype html>
     <div class="card"><div id="total" class="metric">–</div><div class="label">postal codes cached</div></div>
     <div class="card"><div id="successful" class="metric ok">–</div><div class="label">successful cached codes</div></div>
     <div class="card"><div id="failed" class="metric bad">–</div><div class="label">failed / unassigned cached codes</div></div>
-    <div class="card"><div id="weekLookups" class="metric">–</div><div class="label">lookups recorded this week</div></div>
+    <div class="card"><div id="weekLookups" class="metric">–</div><div class="label">lookups in the trailing 7 days</div></div>
   </div>
 
   <div class="section-title">
-    <div><h2>Export and reports</h2><div class="muted">Download the full cache or send the configured weekly email report.</div></div>
+    <div><h2>Export and reports</h2><div class="muted">Download cached data and failed attempts, or preview the scheduled weekly report.</div></div>
   </div>
   <div class="card toolbar">
-    <a class="button primary" href="/api/cache/export.csv">Export cached data CSV</a>
+    <a class="button primary" href="/api/cache/export.csv?include_expired=1">Export cached data CSV</a>
+    <a class="button" href="/api/lookups/failures.csv?days=3650">Export failure history CSV</a>
     <button id="sendReport">Preview weekly report</button>
     <span id="reportStatus" class="muted"></span>
   </div>
 
+  <h2>Major-donor coverage</h2>
+  <p id="cohortProgress" class="card">Loading…</p>
+  <a class="button" href="/api/cohort/export.csv">Export major-donor coverage CSV</a>
   <div class="section-title">
-    <div><h2>Recent daily cache additions</h2><div class="muted">Based on when each postal code was first cached or refreshed.</div></div>
+    <div><h2>Daily lookup outcomes</h2><div class="muted">Trailing 7 days, grouped by UTC date. Cache hits do not represent new captures.</div></div>
   </div>
+  <p id="captureWarning" class="warn" role="status"></p>
   <div class="card"><div id="dailyCounts" class="muted">Loading…</div></div>
 
   <div class="section-title">
-    <div><h2>Postal codes</h2><div class="muted">Search cached successes, failures, and invalid records.</div></div>
+    <div><h2>Postal codes</h2><div class="muted">Search all cached records, including expired entries. Net worth is historical segment reference data; unavailable values remain blank.</div></div>
   </div>
   <div class="toolbar">
     <input id="search" placeholder="Search postal code, segment, message" size="34">
@@ -98,12 +107,19 @@ DASHBOARD_HTML = """<!doctype html>
     <button id="refresh" class="primary">Refresh</button>
   </div>
   <table>
-    <thead><tr><th>Postal code</th><th>Status</th><th>Segment</th><th>Name</th><th>Home type</th><th>Income</th><th>Net worth</th><th>Cached</th><th>Message</th></tr></thead>
+    <thead><tr><th>Postal code</th><th>Status</th><th>Segment</th><th>Name</th><th>Home type</th><th>Income</th><th>Historical net worth</th><th>Cached</th><th>Message</th></tr></thead>
     <tbody id="rows"><tr><td colspan="9" class="muted">Loading…</td></tr></tbody>
   </table>
+  <div class="toolbar"><button id="previous">Previous</button><span id="pageInfo"></span><button id="next">Next</button></div>
+  <div class="section-title"><h2>Failed lookup history</h2></div>
+  <p class="muted">Includes quota/network errors that are not stored in the cache. Dates are UTC. Export downloads all retained failures.</p>
+  <div class="card" id="failures">Loading…</div>
+  <div class="toolbar"><button id="failurePrevious">Previous</button><span id="failurePageInfo"></span><button id="failureNext">Next</button></div>
 </main>
 <script>
 const fmt = new Intl.NumberFormat();
+let offset = 0, failureOffset = 0;
+const pageSize = 100;
 function text(id, value) { document.getElementById(id).textContent = value; }
 function esc(value) { return String(value ?? '').replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c])); }
 async function fetchJson(url, options) {
@@ -121,23 +137,29 @@ async function loadSummary() {
   text('successful', fmt.format(breakdown.success || 0));
   text('failed', fmt.format((breakdown.error || 0) + (breakdown.invalid || 0)));
   text('weekLookups', fmt.format(week.lookups || 0));
-  const counts = data.daily_cache_counts || [];
+  text('captureWarning', week.lookups && !week.upstream_attempts ? 'No new upstream lookups in the last 7 days. Check whether the enrichment queue is repeating already captured postal codes.' : '');
+  const cohort = data.cohort || {};
+  text('cohortProgress', cohort.configured ? `${cohort.captured} / ${cohort.unique_codes} codes captured · ${cohort.pending} pending · ${cohort.failed} failed · ${cohort.incomplete} incomplete. ${cohort.source_rows} source accounts; ${cohort.excluded_rows} address exceptions. Daily target: 10 new codes; no automatic repeats.` : 'Cohort has not been imported.');
+  const counts = week.by_day || [];
   document.getElementById('dailyCounts').innerHTML = counts.length ? counts.map(row =>
-    `<div><strong>${esc(row.day)}</strong>: ${fmt.format(row.total || 0)} cached · <span class="ok">${fmt.format(row.successful || 0)} success</span> · <span class="bad">${fmt.format(row.failed || 0)} failed</span></div>`
+    `<div><strong>${esc(row.day)}</strong>: ${fmt.format(row.lookups || 0)} lookups · ${fmt.format(row.cache_hits || 0)} cache hits · ${fmt.format(row.upstream_attempts || 0)} upstream attempts · <span class="ok">${fmt.format(row.upstream_successful || 0)} upstream success</span> · <span class="bad">${fmt.format(row.failed || 0)} failed</span> · ${fmt.format(row.unique_postal_codes || 0)} unique codes · ${fmt.format(row.newly_captured || 0)} first captures in recorded history</div>`
   ).join('') : 'No daily additions recorded in the selected window.';
 }
 async function loadRows() {
-  const params = new URLSearchParams({ limit: '500' });
+  const params = new URLSearchParams({ limit: String(pageSize), offset: String(offset), include_expired: '1' });
   const search = document.getElementById('search').value.trim();
   const status = document.getElementById('status').value;
   if (search) params.set('search', search);
   if (status) params.set('status', status);
   const data = await fetchJson('/api/cache/entries?' + params.toString());
   const tbody = document.getElementById('rows');
+  document.getElementById('previous').disabled = offset === 0;
+  document.getElementById('next').disabled = data.count < pageSize;
+  text('pageInfo', `Page ${offset / pageSize + 1} · ${data.count} records`);
   if (!data.entries?.length) { tbody.innerHTML = '<tr><td colspan="9" class="muted">No matching entries.</td></tr>'; return; }
   tbody.innerHTML = data.entries.map(row => `
     <tr>
-      <td><strong>${esc(row.postal_code)}</strong></td>
+      <td><details><summary><strong>${esc(row.postal_code)}</strong></summary><pre>${esc(JSON.stringify(row, null, 2))}</pre></details></td>
       <td><span class="pill ${esc(row.status)}">${esc(row.status)}</span></td>
       <td>${esc(row.segment_number || '')}</td>
       <td>${esc(row.segment_name || '')}</td>
@@ -156,10 +178,23 @@ async function sendReport() {
     status.textContent = data.body || 'No report body returned.';
   } catch (err) { status.textContent = 'Report preview unavailable: ' + err.message; }
 }
-document.getElementById('refresh').addEventListener('click', () => { loadSummary(); loadRows(); });
+async function loadFailures() {
+  const data = await fetchJson(`/api/lookups?failures=1&days=3650&limit=${pageSize}&offset=${failureOffset}`);
+  document.getElementById('failures').innerHTML = data.entries.length ? data.entries.map(row => `<p><strong>${esc(row.postal_code)}</strong> · ${esc(row.requested_at)} · ${esc(row.source)} · ${esc(row.message || row.status)}</p>`).join('') : 'No failed attempts recorded.';
+  document.getElementById('failurePrevious').disabled = failureOffset === 0;
+  document.getElementById('failureNext').disabled = data.count < pageSize;
+  text('failurePageInfo', `Page ${failureOffset / pageSize + 1} · ${data.count} attempts`);
+}
+function showError(err) { text('captureWarning', 'Could not load data: ' + err.message); }
+document.getElementById('refresh').addEventListener('click', () => { offset = 0; loadSummary().catch(showError); loadRows().catch(showError); loadFailures().catch(showError); });
+document.getElementById('previous').addEventListener('click', () => { offset = Math.max(0, offset - pageSize); loadRows().catch(showError); });
+document.getElementById('next').addEventListener('click', () => { offset += pageSize; loadRows().catch(showError); });
+document.getElementById('failurePrevious').addEventListener('click', () => { failureOffset = Math.max(0, failureOffset - pageSize); loadFailures().catch(showError); });
+document.getElementById('failureNext').addEventListener('click', () => { failureOffset += pageSize; loadFailures().catch(showError); });
 document.getElementById('sendReport').addEventListener('click', sendReport);
-document.getElementById('search').addEventListener('keydown', e => { if (e.key === 'Enter') loadRows(); });
-loadSummary().catch(err => console.error(err));
+document.getElementById('search').addEventListener('keydown', e => { if (e.key === 'Enter') { offset = 0; loadRows().catch(showError); } });
+loadSummary().catch(showError);
+loadFailures().catch(showError);
 loadRows().catch(err => { document.getElementById('rows').innerHTML = `<tr><td colspan="9" class="bad">${esc(err.message)}</td></tr>`; });
 </script>
 </body>
@@ -210,7 +245,7 @@ def has_valid_api_key() -> bool:
 def has_valid_dashboard_auth() -> bool:
     username, password = dashboard_credentials()
     if not password:
-        return True
+        return False
     provided_username, provided_password = parse_basic_auth()
     return secrets.compare_digest(provided_username or "", username or "") and secrets.compare_digest(provided_password or "", password)
 
@@ -226,11 +261,14 @@ def require_authentication():
     if request.path == "/health" or request.method == "OPTIONS":
         return None
 
-    dashboard_paths = {"/", "/dashboard", "/api/dashboard/summary", "/api/cache/entries", "/api/cache/export.csv", "/api/reports/weekly", "/api/reports/weekly/send"}
+    dashboard_paths = {"/", "/dashboard", "/api/dashboard/summary", "/api/cache/entries", "/api/cache/export.csv", "/api/reports/weekly", "/api/lookups", "/api/lookups/failures.csv", "/api/cohort", "/api/cohort/export.csv"}
     if request.path in dashboard_paths:
-        if has_valid_dashboard_auth() or has_valid_api_key():
+        if has_valid_dashboard_auth() or (os.environ.get("PRIZM_API_KEY") and has_valid_api_key()):
             return None
         return dashboard_auth_required()
+
+    if request.path == "/api/reports/weekly/send" and not os.environ.get("PRIZM_API_KEY"):
+        return jsonify({"error": "Email sending requires a configured API key"}), 503
 
     if request.path.startswith("/api/") and has_valid_api_key():
         return None
@@ -304,6 +342,7 @@ def get_prizm_code(postal_code: str, endpoint: str = "single", batch_id: Optiona
             "home_type": "",
             "status": "error",
             "message": str(exc),
+            "retryable": True,
         }
 
     if should_cache:
@@ -383,6 +422,75 @@ def get_batch_prizm():
     )
 
 
+def cohort_queue():
+    return CohortQueue(cache_manager.db_path)
+
+
+@app.route("/api/cohort", methods=["GET"])
+def cohort_status():
+    queue = cohort_queue()
+    return jsonify({"summary": queue.summary(), "entries": queue.entries()})
+
+
+@app.route("/api/cohort/export.csv", methods=["GET"])
+def cohort_export():
+    response = Response(cohort_queue().export_csv(), mimetype="text/csv")
+    response.headers["Content-Disposition"] = "attachment; filename=major-donor-coverage.csv"
+    return response
+
+
+@app.route("/api/cache/import-history", methods=["POST"])
+def import_historical_cache():
+    if not os.environ.get("PRIZM_API_KEY") or not has_valid_api_key():
+        return jsonify({"error": "Historical import requires an API key"}), 401
+    if request.content_length is None or request.content_length > 2_000_000:
+        return jsonify({"error": "A historical JSON payload under 2 MB is required"}), 400
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "Expected a JSON object"}), 400
+    try:
+        result = merge_history(cache_manager.db_path, data.get("rows"))
+    except (ValueError, TypeError):
+        return jsonify({"error": "Invalid historical data; import rolled back"}), 400
+    return jsonify(result)
+
+
+@app.route("/api/cohort/import", methods=["POST"])
+def import_cohort():
+    if not os.environ.get("PRIZM_API_KEY") or not has_valid_api_key():
+        return jsonify({"error": "Import requires an API key"}), 401
+    if request.content_length is None or request.content_length > 1_000_000:
+        return jsonify({"error": "A CSV body under 1 MB is required"}), 400
+    try:
+        import io
+        summary = cohort_queue().import_accounts(io.StringIO(request.get_data().decode("utf-8-sig")))
+    except (ValueError, UnicodeError):
+        return jsonify({"error": "Invalid Canadian billing-address CSV; cohort unchanged"}), 400
+    return jsonify(summary)
+
+
+@app.route("/api/cohort/capture", methods=["POST"])
+def capture_cohort():
+    # Collection is a mutation and always requires an explicit API key.
+    if not os.environ.get("PRIZM_API_KEY") or not has_valid_api_key():
+        return jsonify({"error": "Collection requires an API key"}), 401
+    queue = cohort_queue()
+    if not queue.summary()["configured"]:
+        return jsonify({"error": "Major-donor cohort has not been imported"}), 503
+    results = []
+    # One code per call keeps Salesforce callouts below transaction time limits.
+    # Its queueable chains ten calls; the database also enforces the daily ceiling.
+    for _ in range(1):
+        code = queue.claim()
+        if code is None:
+            break
+        # Claim persists before network I/O: retries/concurrent requests cannot repeat a code.
+        result = get_prizm_code(code, endpoint="cohort")
+        queue.finish(code, result)
+        results.append(result)
+    return jsonify({"results": results, "summary": queue.summary()})
+
+
 @app.route("/api/segments", methods=["GET"])
 def get_segments():
     return jsonify({"status": "success", "segments": prizm_client.get_all_segments()})
@@ -390,7 +498,27 @@ def get_segments():
 
 @app.route("/api/dashboard/summary", methods=["GET"])
 def dashboard_summary():
-    return jsonify(cache_manager.get_dashboard_summary())
+    summary = cache_manager.get_dashboard_summary()
+    summary["cohort"] = cohort_queue().summary()
+    return jsonify(summary)
+
+
+@app.route("/api/lookups", methods=["GET"])
+def lookup_events():
+    rows = cache_manager.list_lookup_events(
+        failures_only=request.args.get("failures") == "1",
+        days=request.args.get("days", 7, type=int),
+        limit=request.args.get("limit", 100, type=int),
+        offset=request.args.get("offset", 0, type=int),
+    )
+    return jsonify({"entries": rows, "count": len(rows)})
+
+
+@app.route("/api/lookups/failures.csv", methods=["GET"])
+def export_lookup_failures():
+    response = Response(cache_manager.export_failures_csv(request.args.get("days", 7, type=int)), mimetype="text/csv")
+    response.headers["Content-Disposition"] = "attachment; filename=prizm-failures.csv"
+    return response
 
 
 @app.route("/api/cache/entries", methods=["GET"])
@@ -483,34 +611,49 @@ def get_debug_html(postal_code):
 
 def build_weekly_report(days: int = 7) -> Dict[str, Any]:
     summary = cache_manager.get_dashboard_summary()
-    events = summary.get("lookup_events_7d") or cache_manager.get_lookup_event_summary(days)
+    events = cache_manager.get_lookup_event_summary(days)
+    summary["lookup_events_7d"] = events
+    summary["cohort"] = cohort_queue().summary()
     stats = summary.get("cache_stats", {})
-    daily_counts = summary.get("daily_cache_counts", [])[:days]
-    failures = summary.get("recent_failures", [])[:20]
+    daily_counts = events.get("by_day", [])
+    failures = cache_manager.list_lookup_events(failures_only=True, days=days, limit=20)
 
     subject = os.environ.get("WEEKLY_REPORT_SUBJECT", "PRIZM weekly report")
     lines = [
         "PRIZM weekly report",
         "",
+        f"Window: trailing {days} days; daily dates are UTC.",
+        "API success does not prove Salesforce household updates or email delivery.",
         f"Lookups recorded: {events.get('lookups', 0)}",
         f"Successful lookups: {events.get('successful', 0)}",
         f"Failed lookups: {events.get('failed', 0)}",
         f"Cache hits: {events.get('cache_hits', 0)}",
         f"Upstream attempts: {events.get('upstream_attempts', 0)}",
+        f"Upstream successful: {events.get('upstream_successful', 0)}",
+        f"Upstream failed: {events.get('upstream_failed', 0)}",
+        f"Unique postal codes requested: {events.get('unique_postal_codes', 0)}",
+        f"New captures (first successful lookup in recorded history): {events.get('newly_captured', 0)}",
+        "Historical net worth is a segment reference, not current postal-code wealth.",
         "",
         f"Total active cached postal codes: {stats.get('valid_entries', 0)}",
         f"Cached successes: {(stats.get('status_breakdown') or {}).get('success', 0)}",
         f"Cached failed/unassigned: {((stats.get('status_breakdown') or {}).get('error', 0) + (stats.get('status_breakdown') or {}).get('invalid', 0))}",
         "",
-        "Daily cache additions:",
+        "Daily lookup outcomes (UTC):",
     ]
+    cohort = summary["cohort"]
+    lines.extend(["", "Major-donor Canadian postal-code coverage:",
+                  f"Captured: {cohort['captured']}; pending: {cohort['pending']}; failed: {cohort['failed']}; incomplete: {cohort['incomplete']}",
+                  "Daily target: 10 never-attempted codes. Failed/incomplete attempts require review; no automatic repeats.", ""])
     if daily_counts:
         for row in daily_counts:
-            lines.append(f"- {row.get('day')}: {row.get('total', 0)} total, {row.get('successful', 0)} success, {row.get('failed', 0)} failed")
+            lines.append(f"- {row.get('day')}: {row.get('lookups', 0)} lookups, {row.get('cache_hits', 0)} cached, {row.get('upstream_successful', 0)} upstream successes, {row.get('failed', 0)} failures")
     else:
         lines.append("- None recorded")
 
-    lines.extend(["", "Recent failures/unassigned postal codes:"])
+    if events.get("lookups", 0) and not events.get("upstream_attempts", 0):
+        lines.extend(["", "ATTENTION: All recorded lookups were served without new upstream attempts. Check the enrichment queue for repeated postal codes."])
+    lines.extend(["", "Failed lookup attempts in this reporting window:"])
     if failures:
         for row in failures:
             lines.append(f"- {row.get('postal_code')}: {row.get('message') or row.get('status')}")
