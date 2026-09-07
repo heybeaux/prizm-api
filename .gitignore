@@ -56,3 +56,5 @@ debug_screenshots/
 missing_postal_codes.txt
 postal_code_export*.csv
 postal_code_v2_export*.csv
+
+*.migration.lock

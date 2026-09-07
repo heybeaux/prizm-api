@@ -54,6 +54,16 @@ class HistoricalImportTest(unittest.TestCase):
         result = merge_history(self.cache.db_path, [{'postal_code':'90210','status':'invalid'}])
         self.assertEqual(result['skipped_invalid_format'], 1)
 
+    def test_production_startup_snapshot_is_preserved(self):
+        import sqlite3
+        self.cache.cache_data('V8A 0A8', {'status':'success', 'segment_number':'21'})
+        with patch.dict(os.environ, {'RAILWAY_ENVIRONMENT_ID':'test-production'}):
+            CacheManager(self.cache.db_path)
+            self.cache.delete_cached_data('V8A 0A8')
+            CacheManager(self.cache.db_path)
+        with sqlite3.connect(self.cache.db_path + '.before-cohort-upgrade.db') as db:
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM postal_code_cache').fetchone()[0], 1)
+
     def test_endpoint_auth_and_input_validation(self):
         with patch('app.cache_manager', self.cache), patch.dict(os.environ, {'PRIZM_API_KEY':'key'}):
             client = app.test_client()

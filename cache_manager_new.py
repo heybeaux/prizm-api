@@ -6,6 +6,7 @@ and to support dashboard/reporting metrics.
 """
 
 import csv
+import fcntl
 import io
 import json
 import logging
@@ -27,7 +28,23 @@ class CacheManager:
     def __init__(self, db_path: str = None, cache_duration_days: int = None):
         self.db_path = db_path or os.environ.get("PRIZM_CACHE_DB_PATH", "prizm_cache_v2.db")
         self.cache_duration_days = cache_duration_days or int(os.environ.get("PRIZM_CACHE_DURATION_DAYS", "90"))
-        self._init_database()
+        # Serialize startup migrations across Gunicorn workers. Keep the original
+        # production database before this release adds tables/columns/triggers.
+        with open(self.db_path + ".migration.lock", "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            if os.environ.get("RAILWAY_ENVIRONMENT_ID") and os.path.exists(self.db_path):
+                snapshot = self.db_path + ".before-cohort-upgrade.db"
+                if not os.path.exists(snapshot):
+                    source = sqlite3.connect(self.db_path)
+                    target = sqlite3.connect(snapshot + ".tmp")
+                    try:
+                        source.backup(target)
+                    finally:
+                        target.close()
+                        source.close()
+                    os.replace(snapshot + ".tmp", snapshot)
+                    logger.info("Saved pre-upgrade database snapshot")
+            self._init_database()
 
     @contextmanager
     def _connect(self):
