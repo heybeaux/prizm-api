@@ -148,7 +148,7 @@ private class WCPrizmDailyEnrichmentTest {
         insert new List<Account>{ known, retry };
         Test.setMock(HttpCalloutMock.class, new MissingNetWorthMock());
         Test.startTest();
-        WCPrizmDailyEnrichment.runDaily();
+        System.assertEquals(false, WCPrizmDailyEnrichment.runDaily(), 'Stop chaining when quota or network availability fails.');
         Test.stopTest();
         known = [SELECT Average_Net_Worth_in_Postal_Code__c FROM Account WHERE Id = :known.Id];
         retry = [SELECT PRIZM_Score__c FROM Account WHERE Id = :retry.Id];

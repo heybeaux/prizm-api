@@ -77,6 +77,15 @@ class CohortTest(unittest.TestCase):
             self.assertEqual(response.status_code, 400)
             self.assertEqual(self.queue.summary()['unique_codes'], 30)
 
+    def test_quota_rejection_recovers_on_later_day_without_repeating_success(self):
+        self.queue.import_accounts(io.StringIO('Billing Country Code,Billing Zip/Postal Code\nCA,V8A 0A0\n'))
+        code = self.queue.claim('2026-09-06')
+        self.queue.finish(code, {'status':'error', 'retryable':True})
+        self.assertIsNone(self.queue.claim('2026-09-06'))
+        self.assertEqual(self.queue.claim('2026-09-07'), code)
+        self.queue.finish(code, {'status':'success'})
+        self.assertIsNone(self.queue.claim('2026-09-08'))
+
     def test_capture_before_import_fails_closed(self):
         with self.queue.connect() as db:
             db.execute('DELETE FROM cohort_metadata')
