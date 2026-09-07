@@ -73,9 +73,9 @@ DASHBOARD_HTML = """<!doctype html>
 </header>
 <main>
   <div class="grid">
-    <div class="card"><div id="total" class="metric">–</div><div class="label">postal codes cached</div></div>
-    <div class="card"><div id="successful" class="metric ok">–</div><div class="label">successful cached codes</div></div>
-    <div class="card"><div id="failed" class="metric bad">–</div><div class="label">failed / unassigned cached codes</div></div>
+    <div class="card"><div id="total" class="metric">–</div><div class="label">postal codes stored (all dates)</div></div>
+    <div class="card"><div id="successful" class="metric ok">–</div><div class="label">successful stored codes</div></div>
+    <div class="card"><div id="failed" class="metric bad">–</div><div class="label">failed / unassigned stored codes</div></div>
     <div class="card"><div id="weekLookups" class="metric">–</div><div class="label">lookups in the trailing 7 days</div></div>
   </div>
 
@@ -131,15 +131,15 @@ async function fetchJson(url, options) {
 async function loadSummary() {
   const data = await fetchJson('/api/dashboard/summary');
   const stats = data.cache_stats || {};
-  const breakdown = stats.status_breakdown || {};
+  const breakdown = stats.all_status_breakdown || stats.status_breakdown || {};
   const week = data.lookup_events_7d || {};
-  text('total', fmt.format(stats.valid_entries || 0));
+  text('total', fmt.format(stats.total_entries || 0));
   text('successful', fmt.format(breakdown.success || 0));
   text('failed', fmt.format((breakdown.error || 0) + (breakdown.invalid || 0)));
   text('weekLookups', fmt.format(week.lookups || 0));
   text('captureWarning', week.lookups && !week.upstream_attempts ? 'No new upstream lookups in the last 7 days. Check whether the enrichment queue is repeating already captured postal codes.' : '');
   const cohort = data.cohort || {};
-  text('cohortProgress', cohort.configured ? `${cohort.captured} / ${cohort.unique_codes} codes captured · ${cohort.pending} pending · ${cohort.failed} failed · ${cohort.incomplete} incomplete. ${cohort.source_rows} source accounts; ${cohort.excluded_rows} address exceptions. Daily target: 10 new codes; no automatic repeats.` : 'Cohort has not been imported.');
+  text('cohortProgress', cohort.configured ? `${cohort.captured} / ${cohort.unique_codes} codes captured · ${cohort.pending} pending · ${cohort.failed} failed · ${cohort.incomplete} incomplete. ${cohort.source_rows} source accounts; ${cohort.excluded_rows} address exceptions. Daily target: 10 uncaptured codes; captured codes never repeat.` : 'Cohort has not been imported.');
   const counts = week.by_day || [];
   document.getElementById('dailyCounts').innerHTML = counts.length ? counts.map(row =>
     `<div><strong>${esc(row.day)}</strong>: ${fmt.format(row.lookups || 0)} lookups · ${fmt.format(row.cache_hits || 0)} cache hits · ${fmt.format(row.upstream_attempts || 0)} upstream attempts · <span class="ok">${fmt.format(row.upstream_successful || 0)} upstream success</span> · <span class="bad">${fmt.format(row.failed || 0)} failed</span> · ${fmt.format(row.unique_postal_codes || 0)} unique codes · ${fmt.format(row.newly_captured || 0)} first captures in recorded history</div>`
@@ -644,7 +644,7 @@ def build_weekly_report(days: int = 7) -> Dict[str, Any]:
     cohort = summary["cohort"]
     lines.extend(["", "Major-donor Canadian postal-code coverage:",
                   f"Captured: {cohort['captured']}; pending: {cohort['pending']}; failed: {cohort['failed']}; incomplete: {cohort['incomplete']}",
-                  "Daily target: 10 never-attempted codes. Failed/incomplete attempts require review; no automatic repeats.", ""])
+                  "Daily target: 10 uncaptured codes. Quota/network rejections recover after untouched codes on later days; captured codes never repeat.", ""])
     if daily_counts:
         for row in daily_counts:
             lines.append(f"- {row.get('day')}: {row.get('lookups', 0)} lookups, {row.get('cache_hits', 0)} cached, {row.get('upstream_successful', 0)} upstream successes, {row.get('failed', 0)} failures")

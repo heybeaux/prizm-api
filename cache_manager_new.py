@@ -649,6 +649,8 @@ class CacheManager:
                     """
                 )
                 status_counts = {row[0]: row[1] for row in cursor.fetchall()}
+                cursor.execute("SELECT status, COUNT(*) FROM postal_code_cache GROUP BY status")
+                all_status_counts = {row[0]: row[1] for row in cursor.fetchall()}
 
                 cursor.execute(
                     """
@@ -671,6 +673,7 @@ class CacheManager:
                     "confirmed_entries": confirmed_entries,
                     "unconfirmed_entries": valid_entries - confirmed_entries,
                     "status_breakdown": status_counts,
+                    "all_status_breakdown": all_status_counts,
                     "oldest_entry": oldest,
                     "newest_entry": newest,
                     "database_size_bytes": db_size,

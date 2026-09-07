@@ -94,7 +94,20 @@ class CohortQueue:
                 ORDER BY c.account_rows DESC, c.postal_code LIMIT 1
             ''').fetchone()
             if row is None:
-                return None
+                # A quota/network rejection is not enrichment. Recover these only
+                # after untouched codes, at most once per subsequent calendar day.
+                row = db.execute("""
+                    SELECT c.postal_code FROM donor_cohort c
+                    JOIN cohort_attempts a USING(postal_code)
+                    LEFT JOIN capture_history h USING(postal_code)
+                    WHERE h.postal_code IS NULL AND a.day < ?
+                    AND json_extract(a.result_json, '$.retryable') = 1
+                    ORDER BY a.day, c.account_rows DESC, c.postal_code LIMIT 1
+                """, (day,)).fetchone()
+                if row is None:
+                    return None
+                db.execute("UPDATE cohort_attempts SET day=?, started_at=CURRENT_TIMESTAMP, result_json=NULL WHERE postal_code=?", (day, row[0]))
+                return row[0]
             db.execute('INSERT INTO cohort_attempts (postal_code, day) VALUES (?, ?)', (row[0], day))
             return row[0]
 

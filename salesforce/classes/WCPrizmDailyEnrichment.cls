@@ -73,6 +73,12 @@ public without sharing class WCPrizmDailyEnrichment implements Schedulable, Data
             return false;
         }
 
+        Boolean continueCollection = true;
+        for (PrizmResult result : resultsByPostalCode.values()) {
+            if (result.retryable) {
+                continueCollection = false;
+            }
+        }
         List<Account> updates = new List<Account>();
         for (Account account : [
             SELECT Id, BillingPostalCode
@@ -123,7 +129,7 @@ public without sharing class WCPrizmDailyEnrichment implements Schedulable, Data
             // Ignoring SaveResult previously made unsuccessful updates look completed.
             update updates;
         }
-        return true;
+        return continueCollection;
     }
 
     @TestVisible
