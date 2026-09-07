@@ -220,6 +220,7 @@ class CacheManager:
                     cursor,
                     "postal_code_cache",
                     {
+                        "historical_source": "TEXT",
                         "segment_number": "TEXT",
                         "segment_name": "TEXT",
                         "segment_description": "TEXT",
@@ -709,8 +710,11 @@ class CacheManager:
         if amount is not None:
             if not data.get("average_household_net_worth"):
                 data["average_household_net_worth"] = average_household_net_worth(data.get("segment_number"))
-            data["average_household_net_worth_amount"] = amount
+            if data.get("average_household_net_worth_amount") is None:
+                data["average_household_net_worth_amount"] = amount
         data["net_worth_source"] = "Historical segment reference" if data.get("average_household_net_worth") else "Unavailable"
+        data["data_source"] = ("Historical import: " + row["historical_source"]
+                               if row["historical_source"] and row["cached_at"] is None else "Current dataset")
         data.update(
             {
                 "cached_at": row["cached_at"],
@@ -852,6 +856,7 @@ class CacheManager:
             "average_household_net_worth",
             "average_household_net_worth_amount",
             "net_worth_source",
+            "data_source",
             "education",
             "urbanity",
             "occupation",

@@ -14,6 +14,7 @@ from flask import Flask, Response, jsonify, make_response, request
 
 from cache_manager_new import cache_manager
 from cohort_queue import CohortQueue
+from historical_import import merge_history
 from prizm_client import PrizmClient, PrizmLookupError, normalize_postal_code
 from segment_net_worth import average_household_net_worth, average_household_net_worth_amount
 
@@ -436,6 +437,22 @@ def cohort_export():
     response = Response(cohort_queue().export_csv(), mimetype="text/csv")
     response.headers["Content-Disposition"] = "attachment; filename=major-donor-coverage.csv"
     return response
+
+
+@app.route("/api/cache/import-history", methods=["POST"])
+def import_historical_cache():
+    if not os.environ.get("PRIZM_API_KEY") or not has_valid_api_key():
+        return jsonify({"error": "Historical import requires an API key"}), 401
+    if request.content_length is None or request.content_length > 2_000_000:
+        return jsonify({"error": "A historical JSON payload under 2 MB is required"}), 400
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "Expected a JSON object"}), 400
+    try:
+        result = merge_history(cache_manager.db_path, data.get("rows"))
+    except (ValueError, TypeError):
+        return jsonify({"error": "Invalid historical data; import rolled back"}), 400
+    return jsonify(result)
 
 
 @app.route("/api/cohort/import", methods=["POST"])
