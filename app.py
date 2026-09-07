@@ -73,9 +73,9 @@ DASHBOARD_HTML = """<!doctype html>
 </header>
 <main>
   <div class="grid">
-    <div class="card"><div id="total" class="metric">–</div><div class="label">postal codes cached</div></div>
-    <div class="card"><div id="successful" class="metric ok">–</div><div class="label">successful cached codes</div></div>
-    <div class="card"><div id="failed" class="metric bad">–</div><div class="label">failed / unassigned cached codes</div></div>
+    <div class="card"><div id="total" class="metric">–</div><div class="label">postal codes stored (all dates)</div></div>
+    <div class="card"><div id="successful" class="metric ok">–</div><div class="label">successful stored codes</div></div>
+    <div class="card"><div id="failed" class="metric bad">–</div><div class="label">failed / unassigned stored codes</div></div>
     <div class="card"><div id="weekLookups" class="metric">–</div><div class="label">lookups in the trailing 7 days</div></div>
   </div>
 
@@ -131,9 +131,9 @@ async function fetchJson(url, options) {
 async function loadSummary() {
   const data = await fetchJson('/api/dashboard/summary');
   const stats = data.cache_stats || {};
-  const breakdown = stats.status_breakdown || {};
+  const breakdown = stats.all_status_breakdown || stats.status_breakdown || {};
   const week = data.lookup_events_7d || {};
-  text('total', fmt.format(stats.valid_entries || 0));
+  text('total', fmt.format(stats.total_entries || 0));
   text('successful', fmt.format(breakdown.success || 0));
   text('failed', fmt.format((breakdown.error || 0) + (breakdown.invalid || 0)));
   text('weekLookups', fmt.format(week.lookups || 0));
